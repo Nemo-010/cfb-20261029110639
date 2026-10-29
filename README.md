@@ -1,204 +1,126 @@
-# cfb — an offload architecture for Cloudflare-shaped workloads
+# cfb
 
-**Status:** design spec, revision 1, 2026-10-29
-**Licence:** 0BSD
+Portable workload platform. The same application code runs on Cloudflare or on your own
+servers. One agent binary per server carries the tunnel, the broker and the supervisor.
 
----
-
-## What this is
-
-A specification for running the *machine-shaped* half of a platform on hardware you own,
-while the *request-shaped* half — the dashboard, its API, its inventory, its audit log —
-stays on Cloudflare Workers.
-
-The premise: Cloudflare is excellent at small, request-shaped work and at global ingress.
-It is poor at long-running, stateful, resource-heavy work. Today the expensive line items
-are R2, Containers/Sandbox, Workers (as a CI runner) and Durable Objects. This document
-replaces the second category, keeps the first, and is honest about which parts are a bad
-trade.
-
-Two constraints are fixed and shape everything else:
-
-1. **The manager lives on Cloudflare.** A SPA on Workers Static Assets plus a Worker API.
-   Not a container, not a VM, not a self-hosted Next.js app. If the Worker cannot serve it,
-   it does not belong in the manager.
-2. **Orchestration is not Cloudflare.** Cloudflare may carry the *control* connection.
-   It must never be the scheduler, the consensus layer, or the data path between machines.
+**Revision 3** · 2026-10-29 · 0BSD
 
 ---
 
-## The stack, in one table
+## Requirements
 
-| Slot | Product being replaced | What we use | Licence | Why |
-|---|---|---|---|---|
-| Control plane | Workers + D1 + DO (as a dashboard backend) | **Cloudflare Workers** (Hono API + Static Assets SPA, D1, one DO per machine, R2 for logs) | proprietary, $5/mo floor | This is the one place Cloudflare is cheap and correct. Keep it. |
-| Connectivity | — | **cloudflared** gateway (one per site) + **Workers VPC** binding | Apache-2.0 | Outbound-only; the Worker reaches the private network without a public hostname. |
-| Machine-to-machine | — | **headscale + Tailscale** overlay | BSD-3 | Cloudflare Mesh caps at 50 nodes, and the self-hosted DO runtime ships plaintext peer HTTP. |
-| Provisioning | Containers / "Computer" | **Incus** (VMs and system containers) | Apache-2.0 | One daemon, one REST API, real VMs and containers behind the same object model. |
-| Orchestration | Containers scheduling | **Nomad** | BUSL-1.1 | One binary, no etcd, `batch` + parameterized dispatch maps onto CI exactly. |
-| Sandboxed compute | Sandbox SDK | **Firecracker + jailer**, or **E2B Embed** | Apache-2.0 | Hardware isolation per job; E2B is the packaged version of the same idea. |
-| Object storage | R2 | **SeaweedFS** (tier 1), **RustFS** (tier 2) | Apache-2.0 | Only OSS S3 clones with working conditional writes. |
-| Edge runtime | Workers | **celld** (fleet) / **workerd** (single node) | Apache-2.0 | Runs the `wrangler.json` you already have, including DOs, KV, Queues, D1, R2, Workflows. |
+1. **Portability.** Application source targets one API surface and runs on both Cloudflare and
+   a self-hosted runtime. Forks are confined to one adapter module, not spread through the app.
+2. **One agent.** A single binary per server is the tunnel connector, the broker and the local
+   supervisor. Not a stack of daemons.
+3. **The manager stays on Cloudflare.** A Worker serves the SPA and API, and is the only place
+   credentials live.
+4. **Control plane on Cloudflare, data plane off it.** Cloudflare carries management traffic.
+   It does not carry scheduler consensus or machine-to-machine replication.
 
 ---
 
-## The three-plane rule
-
-This is the single most important design decision in the document, and it is the one most
-such designs get wrong. Every connection in the system belongs to exactly one of three planes,
-and they use different transports.
+## Design
 
 ```mermaid
 flowchart TB
-  subgraph P1["Plane 1 — control (Cloudflare)"]
-    SPA["SPA on Workers Static Assets"]
-    API["Worker API + DO per machine"]
-    SPA --> API
+  subgraph CF["Cloudflare"]
+    SPA["SPA"]
+    API["Worker API"]
+    D1[("D1: desired state")]
+    R2[("R2: logs")]
+    SPA --> API --> D1
+    API --> R2
   end
 
-  subgraph P2["Plane 2 — management (Cloudflare Tunnel)"]
-    GW["cloudflared gateway<br/>one per site, outbound QUIC"]
+  subgraph NODE["Node (one binary)"]
+    A["cfbd"]
+    W["workerd"]
+    C["container"]
+    A --> W
+    A --> C
   end
 
-  subgraph P3["Plane 3 — data (your overlay)"]
-    N1["machine A"]
-    N2["machine B"]
-    N3["machine C"]
-    N1 --- N2
-    N2 --- N3
-    N1 --- N3
-  end
-
-  API -->|"Workers VPC binding<br/>vpc_networks → cf1:network"| GW
-  GW -->|"HTTP API calls<br/>Nomad 4646, Incus, SeaweedFS 8333"| N1
-  N1 -.->|"Nomad Raft 4647, gossip 4648<br/>celld peer HTTP<br/>NEVER via Cloudflare"| N2
+  API -->|"Workers VPC binding"| A
+  A -->|"outbound only"| API
 ```
 
-- **Plane 1 — control.** Browser to Worker. Same origin, no CORS, no client install.
-- **Plane 2 — management.** Worker to a private API, through one tunnel, on demand. Small
-  request/response traffic only: submit a job, read status, stream a log tail.
-- **Plane 3 — data.** Machine to machine. Raft, gossip, replication, build caches,
-  celld peer traffic. This plane never touches Cloudflare, for three reasons: latency,
-  blast radius, and the fact that Cloudflare Tunnel carries no UDP and would silently break
-  k3s flannel, Nomad gossip and Swarm VXLAN.
-
-A design that collapses plane 3 into plane 2 works in a demo and fails on the first
-scheduler election.
+`cfbd` dials out and holds one connection. The Worker pushes desired state and calls
+capabilities over it. Nothing on the node listens on a public interface.
 
 ---
 
-## Verified constraints that drive the design
+## The portability contract
 
-These are the numbers that killed the obvious approaches. Each was fetched from the primary
-source on 2026-10-29; see [`docs/00-constraints.md`](docs/00-constraints.md) for the quotes.
+Application code targets the **Portable Workers Subset**: the APIs that run unchanged on both
+runtimes.
 
-| Constraint | Value | Consequence |
+| Portable | Note |
+|---|---|
+| ESM `fetch` handler, `env`, `vars` | module syntax only; service-worker syntax is not portable |
+| KV | strong consistency differs, semantics do not |
+| R2 (S3) | no presigned URLs, no public bucket URL |
+| D1 (SQLite) | single-statement `prepare`; no replicas, no `dump()` |
+| Queues (produce + consume) | no pull consumers |
+| Durable Objects, SQLite storage, alarms | one alarm per object |
+| WebSockets + hibernation | reconnect on cell move |
+| Service bindings, RPC | no stub passing across isolates |
+| Workflows | no `schedules` |
+| Cron Triggers | plain expressions |
+| HTMLRewriter, WebAssembly, static assets, `waitUntil` | |
+
+Everything else — presigned URLs, the Cache API, `request.cf`, `node:crypto` ciphers, read
+replicas, Workers AI — goes through `@cfb/port`, a single adapter module with one runtime
+switch. See [`docs/01-portability.md`](docs/01-portability.md) for the full fork list.
+
+**Rule:** `if (runtime === ...)` appears in exactly one directory. A lint rule enforces it.
+
+---
+
+## Stack
+
+| Layer | Choice | Why |
 |---|---|---|
-| Container lifetime | no fixed max runtime, but default `sleepAfter` 10 min and 6 h max inactivity timeout | A long build needs a keep-alive you own, and host events can still stop it. |
-| Container instance ceiling | 4 vCPU / 12 GiB / 20 GB | **The real blocker.** A large compile does not fit. |
-| Container image storage | 50 GB per account | One toolchain-heavy CI image can consume it. |
-| Workers Builds | 20-minute hard timeout, 6 concurrent | Not a CI product. |
-| Workers memory | 128 MB per isolate | Fine for a dashboard; fatal for anything else. |
-| Cloudflare Mesh | 50 nodes per account | Cannot be the machine-to-machine plane for a growing fleet. |
-| Cloudflare Tunnel | no UDP on public hostnames; TCP via WebSocket | Rules out k3s, Swarm, Nomad gossip over Tunnel. |
-| Workers VPC | public beta, free while beta | The right control path today, with a pricing cliff ahead. |
-
-The honest reading: Cloudflare's compute products are not too expensive for this workload.
-They are **too small**, and they interrupt long work. You are not buying a discount, you are
-buying a job that survives. See [`docs/09-cost.md`](docs/09-cost.md) — on list prices the two
-are close to neutral at realistic utilisation (break-even ~22% duty at a generous 54.6 nodes
-per ops person, ~29% at a realistic 10), and the break-even is set by staffing, not by
-electricity.
+| Manager | Worker + Static Assets + D1 + R2 | cheap, up when the fleet is not |
+| Node agent | **`cfbd`** (one static binary) | tunnel + broker + supervisor in one process |
+| Workers runtime | **workerd** (child process) | the actual runtime, Apache-2.0 |
+| Containers | containerd or Docker API, whichever is present | no new daemon to install |
+| Untrusted code | Firecracker (optional) | microVM isolation when the code is not yours |
+| Object storage | **any S3 endpoint**: R2, SeaweedFS, Garage, MinIO | storage is a URL, not a component |
+| Overlay (optional) | WireGuard / headscale | only when nodes must talk to each other |
 
 ---
 
-## Tiers
+## What this is not
 
-The full stack is six systems. Most people need one. Start at the tier that matches the
-problem and only move up when a specific constraint forces it.
-
-### Tier 0 — one box, one tunnel
-
-```
-machine ── cloudflared ── Cloudflare ── Worker SPA
-   └── Docker / systemd units
-```
-
-Nomad in single-node mode (server + client on the same host), SeaweedFS single node with a
-Postgres filer backend, one `cloudflared`. No celld, no overlay, no Incus. This covers
-"replace my CI runner and my S3 bucket" for one or two hosts. It is roughly a weekend.
-
-### Tier 1 — a small fleet
-
-Add headscale for the overlay, Incus for machine provisioning, and a 3-node SeaweedFS.
-Nomad stays at one server until you actually need HA. This is the recommended resting point
-for a team of one to five.
-
-### Tier 2 — the full offload
-
-Add celld for self-hosted Workers/DO, a 3-server Nomad Raft quorum, Firecracker (or E2B
-Embed) for untrusted job isolation, and a second gateway for site redundancy. Only worth it
-if you are actually running Workers-style applications of your own.
+| Rejected | Why |
+|---|---|
+| Nomad | creates no machines, quotas are a no-op in the free build, BUSL-1.1, and its Raft must not cross Cloudflare — the scheduling it provides is not worth a second control plane at this scale |
+| Incus / Proxmox | a second API and a second auth model for a job the agent can do with the container runtime already on the host |
+| celld | runs one application per fleet, needs a conditional-write bucket, two contributors, beta; used only when a fleet of Workers apps is the actual requirement |
+| SeaweedFS as a component | it is a storage *product*; the agent treats storage as an S3 URL, so this is a deployment choice |
+| Cloudflare Containers | 4 vCPU / 12 GiB / 20 GB ceiling, 50 GB image budget per account, interruptible hosts |
+| Cloudflare Sandbox | instances stop on inactivity by default, no persistent disk |
+| Workers Builds | 20-minute hard timeout, 6 concurrent |
 
 ---
 
-## What this does not solve
-
-Written down because a spec that only lists wins is a sales document.
-
-- **It barely saves money at all.** At realistic utilisation the two options are within a
-  few dollars per container-month of each other. The premium buys reliability, not savings.
-- **It does not remove the Cloudflare dependency.** The manager is still a Cloudflare
-  application. You have moved the expensive, fragile part; you have not left.
-- **It does not give you R2's egress economics.** Free egress is R2's single best feature
-  and nothing self-hosted reproduces it unless you own your transit.
-- **It does not make multi-tenancy safe.** Nomad's resource quotas are a no-op in the free
-  build; celld runs one application per fleet; SeaweedFS ships with S3 auth **off**. Jobs from
-  different repositories are mutually untrusted and are isolated by microVM, not by the
-  scheduler. There is no billing boundary between them.
-- **It does not remove the single point of authority.** The Worker holds every substrate
-  credential, so a Cloudflare account compromise is a fleet compromise. See
-  [`docs/02-connectivity.md`](docs/02-connectivity.md#trust-concentration).
-- **It does not beat Fargate on compute.** At a realistic 24% duty cycle, Fargate is cheaper
-  than owned metal and needs no operator. Owned metal is justified by egress, by storage
-  volume, by data residency, or by a workload no managed platform will accept.
-- **It does not survive the bus factor.** SeaweedFS is 54% one person. celld has two
-  contributors. headscale is effectively one maintainer. You are signing up to own this.
-
----
-
-## Repo map
+## Layout
 
 ```
-README.md                  this file — the architecture and the verdict
-docs/00-constraints.md     what is being replaced, with verified numbers
-docs/01-architecture.md    the reference build, component by component
-docs/02-connectivity.md    the three-plane rule in practice
-docs/03-orchestration.md   Nomad and Incus
-docs/04-compute.md         Firecracker, E2B, and what "sandbox" should mean
-docs/05-storage.md         SeaweedFS, RustFS, and the conditional-write problem
-docs/06-edge-runtime.md    celld and workerd on your own metal
-docs/07-control-plane.md   the SPA on Workers, and the API it speaks
-docs/08-threat-model.md    what an attacker does with each component
-docs/09-cost.md            the break-even, with every assumption written down
-docs/10-failure-modes.md   what breaks, and what you do at 3am
-docs/11-roadmap.md         build order
-docs/12-operations.md      backup, restore, out-of-band access, capacity, upgrades
-spec/openapi.yaml          the control-plane API sketch
-landscape/                 twelve deep code reviews of candidate projects
-research/                  eleven research lanes, with sources
-critique/                  five adversarial reviews, and what changed because of them
+README.md                 this file
+docs/01-portability.md    the contract, the 13 forks, the adapter seam
+docs/02-agent.md          cfbd: process model, protocol, capabilities
+docs/03-workloads.md      containers, microVMs, workerd
+docs/04-storage.md        storage as a URL
+docs/05-control-plane.md  the Worker, the API, reconciliation
+docs/06-security.md       trust boundaries and the default-insecure list
+docs/07-operations.md     install, upgrade, backup, restore, out-of-band access
+docs/08-cost.md           break-even, with the arithmetic
+docs/09-roadmap.md        build order
+SURVEY.md                 every candidate project, verdict, licence
+REVIEW.md                 what changed from revision 2 and why
+spec/api.yaml             control-plane API
+spec/agent.md             agent protocol
+reference/                runnable skeleton
 ```
-
-## A note on the name
-
-The design borrows its shape from the Electrosphere: a thin, always-present network layer
-that everything routes through, with the actual industrial capacity sitting behind it in
-buildings you control. Neucom Incorporated organises itself the same way — a small
-coordination surface, five departments doing the heavy work, and a slogan about providing
-the software that shapes the world of tomorrow. This document is the coordination surface
-and the wiring diagram for the departments.
-
----
-
-*0BSD. Take it, change it, ship it, no attribution required.*

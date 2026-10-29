@@ -1,52 +1,29 @@
 openapi: 3.1.0
 info:
   title: cfb control plane
-  version: 0.1.0
+  version: 3.0.0
   description: |
-    The API the Workers-hosted SPA speaks. It is a thin, credential-holding proxy in front of
-    Nomad, Incus, SeaweedFS and celld. Every mutating call is idempotent; no call waits for a
-    substrate operation to finish.
-
-    Errors carry a machine-readable `code` and a `retryable` boolean.
-
+    Thin credential-holding proxy between the SPA and the node agents. No call waits for a
+    workload operation; every mutation is idempotent; errors carry `code` and `retryable`.
 servers:
-  - url: https://cfb.example.com/api/v1
-
+  - url: https://cfb.example/api/v1
 security:
   - AccessJWT: []
-
-tags:
-  - name: nodes
-  - name: jobs
-  - name: machines
-  - name: storage
-  - name: apps
-  - name: audit
 
 paths:
   /nodes:
     get:
-      tags: [nodes]
-      summary: List enrolled nodes with health
+      summary: List nodes with health
       parameters:
-        - name: site
-          in: query
-          schema: { type: string }
-        - name: state
-          in: query
-          schema: { type: string, enum: [pending, ready, stale, draining, revoked] }
+        - { name: state, in: query, schema: { type: string, enum: [pending, ready, stale, draining, revoked] } }
       responses:
         "200":
-          description: Nodes
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Node" }
+              schema: { type: array, items: { $ref: "#/components/schemas/Node" } }
 
   /nodes/enroll:
     post:
-      tags: [nodes]
       summary: Mint a one-time enrolment token
       requestBody:
         required: true
@@ -54,255 +31,127 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name, site, roles]
+              required: [name, capabilities]
               properties:
                 name: { type: string }
-                site: { type: string }
-                roles:
+                labels: { type: object, additionalProperties: { type: string } }
+                capabilities:
                   type: array
-                  items: { type: string, enum: [ci, storage, server, gateway, celld, incus] }
+                  items: { type: string, enum: [exec, container, vm, workerd, port.forward, fs, metrics, storage.proxy] }
       responses:
         "201":
-          description: Token, valid 15 minutes, single use
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   node_id: { type: string }
-                  token: { type: string }
+                  token: { type: string, description: single use, 15 minutes }
                   expires_at: { type: string, format: date-time }
 
   /nodes/{id}/drain:
     post:
-      tags: [nodes]
-      summary: Mark the Nomad node ineligible and wait for allocations to finish
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Stop accepting new workloads, let running ones finish
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses:
         "202": { description: Draining }
-        "409": { $ref: "#/components/responses/Conflict" }
 
   /nodes/{id}/revoke:
     post:
-      tags: [nodes]
-      summary: Revoke node tokens and remove the node from the overlay
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Revoke the node credential
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses:
         "204": { description: Revoked }
 
-  /jobs:
+  /workloads:
     get:
-      tags: [jobs]
-      summary: List jobs
+      summary: List workloads
       parameters:
-        - name: state
-          in: query
-          schema: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
-        - name: limit
-          in: query
-          schema: { type: integer, default: 50, maximum: 200 }
+        - { name: node_id, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
       responses:
         "200":
-          description: Jobs
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Job" }
+              schema: { type: array, items: { $ref: "#/components/schemas/Workload" } }
+
+  /workloads/{id}:
+    put:
+      summary: Upsert a workload spec; bumps generation
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkloadSpec" }
+      responses:
+        "202":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workload" }
+    delete:
+      summary: Stop and remove
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "202": { description: Stopping }
+
+  /jobs:
     post:
-      tags: [jobs]
-      summary: Submit a job
+      summary: Submit a one-shot job
       parameters:
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: { type: string }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [recipe, ref]
-              properties:
-                repo: { type: string }
-                ref: { type: string }
-                recipe: { type: string, description: Name of the build recipe to run }
-                timeout_s: { type: integer, default: 2700 }
+              allOf:
+                - $ref: "#/components/schemas/WorkloadSpec"
+                - type: object
+                  properties:
+                    node_id: { type: string, description: omit to let the control plane place it }
       responses:
         "202":
-          description: Accepted
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Job" }
-
-  /jobs/{id}:
-    get:
-      tags: [jobs]
-      summary: Job detail with attempts
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: Job
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Job" }
+              schema: { $ref: "#/components/schemas/Workload" }
 
   /jobs/{id}/logs:
     get:
-      tags: [jobs]
-      summary: Live log stream (Server-Sent Events)
-      description: |
-        Cursor-based. Clients reconnect with `?cursor=` rather than resuming a broken stream,
-        because the Workers VPC path has no stream resumption.
+      summary: Live log stream (SSE), cursor-based
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
-        - name: cursor
-          in: query
-          schema: { type: string }
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
       responses:
         "200":
-          description: text/event-stream of log lines
           content:
             text/event-stream:
               schema: { type: string }
 
   /jobs/{id}/cancel:
     post:
-      tags: [jobs]
-      summary: Cancel a job and its allocation
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Cancel a running job
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses:
         "202": { description: Cancelling }
 
-  /machines:
-    get:
-      tags: [machines]
-      summary: Incus instances, cached view
-      responses:
-        "200":
-          description: Machines
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Machine" }
+  /storage/presign:
     post:
-      tags: [machines]
-      summary: Create a VM or system container from a profile
-      parameters:
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: { type: string }
+      summary: Presigned URL; bytes never transit the Worker
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name, profile]
+              required: [bucket, key, method]
               properties:
-                name: { type: string }
-                profile: { type: string, example: "vm-2x4x40" }
-                site: { type: string }
-                enroll: { type: boolean, default: true }
-      responses:
-        "202":
-          description: Creating
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Operation" }
-
-  /machines/{id}:
-    delete:
-      tags: [machines]
-      summary: Delete a machine
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
-      responses:
-        "202":
-          description: Deleting
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Operation" }
-
-  /buckets:
-    get:
-      tags: [storage]
-      summary: List buckets with usage
-      responses:
-        "200":
-          description: Buckets
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Bucket" }
-    post:
-      tags: [storage]
-      summary: Create a bucket
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name, purpose]
-              properties:
-                name: { type: string }
-                purpose: { type: string, enum: [images, cache, artifacts, celld] }
-      responses:
-        "201": { description: Created }
-
-  /buckets/{name}/presign:
-    post:
-      tags: [storage]
-      summary: Presigned URL for a direct upload or download
-      description: |
-        Files never transit the Worker. The 128 MB isolate and the 100 MB body cap make
-        proxying a non-option.
-      parameters:
-        - name: name
-          in: path
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [key, method]
-              properties:
+                bucket: { type: string, enum: [images, cache, artifacts, logs] }
                 key: { type: string }
                 method: { type: string, enum: [PUT, GET] }
                 expires_s: { type: integer, default: 900 }
       responses:
         "200":
-          description: URL
           content:
             application/json:
               schema:
@@ -311,73 +160,13 @@ paths:
                   url: { type: string }
                   expires_at: { type: string, format: date-time }
 
-  /apps/{app}/deploy:
-    post:
-      tags: [apps]
-      summary: Deploy a Workers application to a celld fleet
-      parameters:
-        - name: app
-          in: path
-          required: true
-          schema: { type: string }
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [bundle_key]
-              properties:
-                bundle_key: { type: string, description: Object key of the built bundle in the fleet bucket }
-      responses:
-        "202":
-          description: Deploying
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Operation" }
-
-  /apps/{app}/state:
-    get:
-      tags: [apps]
-      summary: celld /state across the fleet
-      parameters:
-        - name: app
-          in: path
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: Per-node state
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    node: { type: string }
-                    deployment: { type: string }
-                    resident_cells: { type: integer }
-                    ready: { type: boolean }
-
   /audit:
     get:
-      tags: [audit]
       summary: Append-only audit log
       parameters:
-        - name: since
-          in: query
-          schema: { type: string, format: date-time }
-        - name: actor
-          in: query
-          schema: { type: string }
+        - { name: since, in: query, schema: { type: string, format: date-time } }
       responses:
         "200":
-          description: Entries
           content:
             application/json:
               schema:
@@ -389,100 +178,55 @@ components:
     AccessJWT:
       type: http
       scheme: bearer
-      description: Cloudflare Access JWT for operators; API token for CI systems.
-
-  responses:
-    Conflict:
-      description: Resource is in a state that forbids the operation
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+      description: Cloudflare Access JWT for operators; API token for CI.
 
   schemas:
-    Error:
-      type: object
-      required: [code, message, retryable]
-      properties:
-        code: { type: string, example: vpc_degraded }
-        message: { type: string }
-        retryable: { type: boolean }
-        detail: { type: object }
-
     Node:
       type: object
       properties:
         id: { type: string }
         name: { type: string }
-        site: { type: string }
-        roles:
-          type: array
-          items: { type: string }
         state: { type: string, enum: [pending, ready, stale, draining, revoked] }
-        overlay_addr: { type: string }
-        nomad_node_id: { type: string }
+        capabilities: { type: array, items: { type: string } }
+        labels: { type: object, additionalProperties: { type: string } }
         last_seen: { type: string, format: date-time }
-        load:
+        capacity:
           type: object
           properties:
-            cpu: { type: number }
-            memory: { type: number }
-            jobs: { type: integer }
+            cpu_millis: { type: integer }
+            memory_mib: { type: integer }
+            disk_free_mib: { type: integer }
 
-    Job:
+    WorkloadSpec:
       type: object
+      required: [kind, image]
       properties:
-        id: { type: string }
-        repo: { type: string }
-        ref: { type: string }
-        recipe: { type: string }
-        state: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
-        attempts:
+        kind: { type: string, enum: [container, vm, workerd] }
+        image: { type: string, description: "digest-pinned reference" }
+        cpu_millis: { type: integer, default: 1000 }
+        memory_mib: { type: integer, default: 1024 }
+        timeout_s: { type: integer }
+        restart: { type: string, enum: [never, on-failure, always], default: on-failure }
+        mounts:
           type: array
           items:
             type: object
             properties:
-              node: { type: string }
-              started_at: { type: string, format: date-time }
-              finished_at: { type: string, format: date-time }
-              exit_code: { type: integer }
-        artifacts:
-          type: array
-          items:
-            type: object
-            properties:
-              key: { type: string }
-              size: { type: integer }
-              sha256: { type: string }
+              from: { type: string, description: "storage prefix" }
+              to: { type: string, description: "absolute path in the workload" }
+        env: { type: object, additionalProperties: { type: string } }
 
-    Machine:
+    Workload:
       type: object
       properties:
         id: { type: string }
-        name: { type: string }
-        profile: { type: string }
-        site: { type: string }
-        kind: { type: string, enum: [virtual-machine, container] }
-        status: { type: string }
         node_id: { type: string }
-
-    Operation:
-      type: object
-      description: |
-        A substrate operation. Incus keeps these in memory, so an unknown id means "check the
-        resource", never "the action failed".
-      properties:
-        id: { type: string }
-        kind: { type: string }
-        status: { type: string, enum: [pending, running, succeeded, failed, unknown] }
-        resource: { type: string }
-
-    Bucket:
-      type: object
-      properties:
-        name: { type: string }
-        purpose: { type: string }
-        objects: { type: integer }
-        bytes: { type: integer }
+        generation: { type: integer }
+        state: { type: string, enum: [pending, starting, running, succeeded, failed, stopped] }
+        exit_code: { type: integer, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        spec: { $ref: "#/components/schemas/WorkloadSpec" }
 
     AuditEntry:
       type: object
@@ -492,3 +236,11 @@ components:
         action: { type: string }
         target: { type: string }
         outcome: { type: string, enum: [allowed, denied, error] }
+
+    Error:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: { type: string, example: vpc_degraded }
+        message: { type: string }
+        retryable: { type: boolean }
