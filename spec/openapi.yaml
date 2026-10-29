@@ -1,0 +1,494 @@
+openapi: 3.1.0
+info:
+  title: cfb control plane
+  version: 0.1.0
+  description: |
+    The API the Workers-hosted SPA speaks. It is a thin, credential-holding proxy in front of
+    Nomad, Incus, SeaweedFS and celld. Every mutating call is idempotent; no call waits for a
+    substrate operation to finish.
+
+    Errors carry a machine-readable `code` and a `retryable` boolean.
+
+servers:
+  - url: https://cfb.example.com/api/v1
+
+security:
+  - AccessJWT: []
+
+tags:
+  - name: nodes
+  - name: jobs
+  - name: machines
+  - name: storage
+  - name: apps
+  - name: audit
+
+paths:
+  /nodes:
+    get:
+      tags: [nodes]
+      summary: List enrolled nodes with health
+      parameters:
+        - name: site
+          in: query
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string, enum: [pending, ready, stale, draining, revoked] }
+      responses:
+        "200":
+          description: Nodes
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Node" }
+
+  /nodes/enroll:
+    post:
+      tags: [nodes]
+      summary: Mint a one-time enrolment token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, site, roles]
+              properties:
+                name: { type: string }
+                site: { type: string }
+                roles:
+                  type: array
+                  items: { type: string, enum: [ci, storage, server, gateway, celld, incus] }
+      responses:
+        "201":
+          description: Token, valid 15 minutes, single use
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string }
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+
+  /nodes/{id}/drain:
+    post:
+      tags: [nodes]
+      summary: Mark the Nomad node ineligible and wait for allocations to finish
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: Draining }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /nodes/{id}/revoke:
+    post:
+      tags: [nodes]
+      summary: Revoke node tokens and remove the node from the overlay
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Revoked }
+
+  /jobs:
+    get:
+      tags: [jobs]
+      summary: List jobs
+      parameters:
+        - name: state
+          in: query
+          schema: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: Jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Job" }
+    post:
+      tags: [jobs]
+      summary: Submit a job
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipe, ref]
+              properties:
+                repo: { type: string }
+                ref: { type: string }
+                recipe: { type: string, description: Name of the build recipe to run }
+                timeout_s: { type: integer, default: 2700 }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: Job detail with attempts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+
+  /jobs/{id}/logs:
+    get:
+      tags: [jobs]
+      summary: Live log stream (Server-Sent Events)
+      description: |
+        Cursor-based. Clients reconnect with `?cursor=` rather than resuming a broken stream,
+        because the Workers VPC path has no stream resumption.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: text/event-stream of log lines
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+  /jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      summary: Cancel a job and its allocation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: Cancelling }
+
+  /machines:
+    get:
+      tags: [machines]
+      summary: Incus instances, cached view
+      responses:
+        "200":
+          description: Machines
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Machine" }
+    post:
+      tags: [machines]
+      summary: Create a VM or system container from a profile
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, profile]
+              properties:
+                name: { type: string }
+                profile: { type: string, example: "vm-2x4x40" }
+                site: { type: string }
+                enroll: { type: boolean, default: true }
+      responses:
+        "202":
+          description: Creating
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Operation" }
+
+  /machines/{id}:
+    delete:
+      tags: [machines]
+      summary: Delete a machine
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202":
+          description: Deleting
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Operation" }
+
+  /buckets:
+    get:
+      tags: [storage]
+      summary: List buckets with usage
+      responses:
+        "200":
+          description: Buckets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Bucket" }
+    post:
+      tags: [storage]
+      summary: Create a bucket
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, purpose]
+              properties:
+                name: { type: string }
+                purpose: { type: string, enum: [images, cache, artifacts, celld] }
+      responses:
+        "201": { description: Created }
+
+  /buckets/{name}/presign:
+    post:
+      tags: [storage]
+      summary: Presigned URL for a direct upload or download
+      description: |
+        Files never transit the Worker. The 128 MB isolate and the 100 MB body cap make
+        proxying a non-option.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, method]
+              properties:
+                key: { type: string }
+                method: { type: string, enum: [PUT, GET] }
+                expires_s: { type: integer, default: 900 }
+      responses:
+        "200":
+          description: URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string }
+                  expires_at: { type: string, format: date-time }
+
+  /apps/{app}/deploy:
+    post:
+      tags: [apps]
+      summary: Deploy a Workers application to a celld fleet
+      parameters:
+        - name: app
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bundle_key]
+              properties:
+                bundle_key: { type: string, description: Object key of the built bundle in the fleet bucket }
+      responses:
+        "202":
+          description: Deploying
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Operation" }
+
+  /apps/{app}/state:
+    get:
+      tags: [apps]
+      summary: celld /state across the fleet
+      parameters:
+        - name: app
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Per-node state
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    node: { type: string }
+                    deployment: { type: string }
+                    resident_cells: { type: integer }
+                    ready: { type: boolean }
+
+  /audit:
+    get:
+      tags: [audit]
+      summary: Append-only audit log
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+        - name: actor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AuditEntry" }
+
+components:
+  securitySchemes:
+    AccessJWT:
+      type: http
+      scheme: bearer
+      description: Cloudflare Access JWT for operators; API token for CI systems.
+
+  responses:
+    Conflict:
+      description: Resource is in a state that forbids the operation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: { type: string, example: vpc_degraded }
+        message: { type: string }
+        retryable: { type: boolean }
+        detail: { type: object }
+
+    Node:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        site: { type: string }
+        roles:
+          type: array
+          items: { type: string }
+        state: { type: string, enum: [pending, ready, stale, draining, revoked] }
+        overlay_addr: { type: string }
+        nomad_node_id: { type: string }
+        last_seen: { type: string, format: date-time }
+        load:
+          type: object
+          properties:
+            cpu: { type: number }
+            memory: { type: number }
+            jobs: { type: integer }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        repo: { type: string }
+        ref: { type: string }
+        recipe: { type: string }
+        state: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        attempts:
+          type: array
+          items:
+            type: object
+            properties:
+              node: { type: string }
+              started_at: { type: string, format: date-time }
+              finished_at: { type: string, format: date-time }
+              exit_code: { type: integer }
+        artifacts:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              size: { type: integer }
+              sha256: { type: string }
+
+    Machine:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        profile: { type: string }
+        site: { type: string }
+        kind: { type: string, enum: [virtual-machine, container] }
+        status: { type: string }
+        node_id: { type: string }
+
+    Operation:
+      type: object
+      description: |
+        A substrate operation. Incus keeps these in memory, so an unknown id means "check the
+        resource", never "the action failed".
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        status: { type: string, enum: [pending, running, succeeded, failed, unknown] }
+        resource: { type: string }
+
+    Bucket:
+      type: object
+      properties:
+        name: { type: string }
+        purpose: { type: string }
+        objects: { type: integer }
+        bytes: { type: integer }
+
+    AuditEntry:
+      type: object
+      properties:
+        at: { type: string, format: date-time }
+        actor: { type: string }
+        action: { type: string }
+        target: { type: string }
+        outcome: { type: string, enum: [allowed, denied, error] }
