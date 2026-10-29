@@ -95,11 +95,49 @@ One connection carries N concurrent streams — log tails, exec sessions, port f
 transfers. Credit-based flow control prevents a fast producer from exhausting the agent's
 memory when the control plane is slow.
 
+`seq` is monotonic per stream so a consumer detects loss after a reconnect. Streams do not
+survive a reconnect; the consumer re-opens with a cursor and the agent replays from its ring
+buffer.
+
 The design is borrowed from two projects that solved it: the multiplexed tunnel in
 `rivet-gg/rivet` (`engine/packages/pegboard-gateway3/src/http_stream/handler.rs`) and the
 msg-id RPC in `ZingerLittleBee/ServerBee` (`crates/server/src/service/agent_manager.rs`).
 Neither is copyable as code — rivet is Apache-2.0 (attribution required), ServerBee is AGPL —
 so both are reimplemented, not vendored.
+
+### State report and reconciliation
+
+```
+StateReport {
+  conn_id, generation,
+  workloads: [{ id, generation, state, pid?, exit_code?, started_at, cpu_millis, memory_mib }],
+  capacity:  { cpu_millis, memory_mib, disk_free_mib },
+  capabilities: [string],
+}
+```
+
+Sent on connect, on change, and every 15 s.
+
+`generation` is the reconciliation key. The control plane compares its desired generation
+against this field and pushes the spec only when the agent is behind. Applying the same
+`(workload_id, generation)` twice is a no-op on the agent, so a duplicate push cannot start a
+second copy.
+
+On reconnect the agent sends a full report and the control plane diffs from scratch. That is
+the recovery path, and it is the reason the report must be complete rather than incremental.
+
+### Errors
+
+| Code | Meaning | Retryable |
+|---|---|---|
+| `unknown_capability` | not declared by the agent | no |
+| `denied` | the agent's local policy refuses | no |
+| `not_found` | workload id unknown | no |
+| `busy` | at capacity | yes, with backoff |
+| `disconnected` | connection lost mid-call | yes |
+| `fenced` | a newer connection owns this node | no — the agent exits |
+| `timeout` | capability exceeded its deadline | yes |
+| `storage_unavailable` | presign or upload failed | yes |
 
 ---
 

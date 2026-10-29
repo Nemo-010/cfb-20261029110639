@@ -122,7 +122,7 @@ few hundred nodes, and it is one query instead of a second control plane.
 
 ## The API
 
-`spec/api.yaml`. Shape:
+Routes. Every mutation is idempotent; no call waits for a workload operation.
 
 ```
 GET    /api/v1/nodes                     list with health
@@ -143,7 +143,7 @@ POST   /api/v1/storage/presign           presigned PUT/GET
 GET    /api/v1/audit                     append-only
 ```
 
-Three rules:
+Rules:
 
 1. **No request waits for a workload operation.** Submit, return 202, let the DO poll.
 2. **Every mutation takes an idempotency key.** The VPC path has no stream resumption, so

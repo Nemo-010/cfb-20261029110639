@@ -3,7 +3,7 @@
 Portable workload platform. The same application code runs on Cloudflare or on your own
 servers. One agent binary per server carries the tunnel, the broker and the supervisor.
 
-**Revision 3** · 2026-10-29 · 0BSD
+**Revision 4** · 2026-10-29 · 0BSD
 
 ---
 
@@ -70,10 +70,19 @@ runtimes.
 | HTMLRewriter, WebAssembly, static assets, `waitUntil` | |
 
 Everything else — presigned URLs, the Cache API, `request.cf`, `node:crypto` ciphers, read
-replicas, Workers AI — goes through `@cfb/port`, a single adapter module with one runtime
-switch. See [`docs/01-portability.md`](docs/01-portability.md) for the full fork list.
+replicas — goes through `@cfb/port`, an adapter registry.
 
-**Rule:** `if (runtime === ...)` appears in exactly one directory. A lint rule enforces it.
+Two levels of portability, and only one is a runtime swap:
+
+| Level | Targets | Cost of switching |
+|---|---|---|
+| Application runtime | Cloudflare, `workerd` (+celld) | one-time; the app itself does not change |
+| Capability | storage, sql, queue, sandbox, actors | config only |
+
+Rivet and E2B are **capability** backends, not runtime substitutes — neither runs Workers code.
+See [`docs/01-portability.md`](docs/01-portability.md).
+
+**Rule:** a backend check appears in exactly one directory. A lint rule enforces it.
 
 ---
 
@@ -109,18 +118,15 @@ switch. See [`docs/01-portability.md`](docs/01-portability.md) for the full fork
 
 ```
 README.md                 this file
-docs/01-portability.md    the contract, the 13 forks, the adapter seam
+docs/01-portability.md    the subset, the 13 forks, the adapter registry
 docs/02-agent.md          cfbd: process model, protocol, capabilities
 docs/03-workloads.md      containers, microVMs, workerd
 docs/04-storage.md        storage as a URL
 docs/05-control-plane.md  the Worker, the API, reconciliation
-docs/06-security.md       trust boundaries and the default-insecure list
+docs/06-security.md       trust boundaries, the default-insecure list
 docs/07-operations.md     install, upgrade, backup, restore, out-of-band access
 docs/08-cost.md           break-even, with the arithmetic
 docs/09-roadmap.md        build order
 SURVEY.md                 every candidate project, verdict, licence
-REVIEW.md                 what changed from revision 2 and why
-spec/api.yaml             control-plane API
-spec/agent.md             agent protocol
-reference/                runnable skeleton
+REVIEW.md                 what changed, and why
 ```

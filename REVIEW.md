@@ -1,4 +1,4 @@
-# Review — revision 3
+# Review — revision 4
 
 What was wrong with revision 2, and what changed. Revisions 1 and 2 were reviewed by five
 hostile reviewers (architecture, security, fact-checking, operations, economics); their
@@ -38,14 +38,17 @@ The mechanisms are borrowed, not invented: the multiplexed tunnel and connection
 rivet, the `msg_id` RPC and agent-owned capability model from ServerBee (reimplemented — AGPL),
 the reconnect lifecycle from omnyssh.
 
-### 3. The documents were fat and carried lore
+### 3. The documents were fat, and carried narrative sections
 
 Revision 2 was 40 files and 165,000 words, including a narrative section about a video game.
 
-**Fixed:** 9 documents, one survey, one review. The lore is gone. The 23 research lanes and 12
-deep reviews are consolidated into `SURVEY.md` — one row per project, with the mechanism worth
-taking and the reason for the verdict. That is the part that was load-bearing; the prose was
-not.
+**Fixed:** 9 documents, one survey, one review, ~13,000 words. The 23 research lanes and 12
+deep reviews are consolidated into `SURVEY.md` — one row per project, the mechanism worth
+taking, the reason for the verdict. That was the load-bearing part; the prose was not.
+
+Revision 4 also removed the `reference/` and `spec/` directories: this is a design document,
+and a skeleton implementation plus a machine-readable schema were duplication of what the
+prose already states. The protocol detail lives in `docs/02-agent.md`.
 
 ---
 
@@ -64,6 +67,23 @@ not.
 | Worker holds all credentials | Stated as residual risk, with blast-radius controls |
 
 ---
+
+## Revision 4: the contract was too narrow
+
+Revision 3's adapter had two targets — Cloudflare and self-hosted — which silently assumed
+that "swap to another hosted backend" meant "swap the whole platform". It does not, and the
+distinction matters:
+
+- **The application runtime** has exactly two real targets. Nothing but `workerd` runs Workers
+  code. Rivet and E2B do not, and a design that implies otherwise is promising a portability
+  it cannot deliver.
+- **Capabilities** — storage, sql, queue, sandbox, actors — are swappable per deployment and
+  cost config, not code.
+
+`docs/01-portability.md` now separates the two levels, gives the capability matrix across
+Cloudflare / self-hosted / hosted third parties, and quantifies the change for each swap:
+0 lines for an app inside the subset, an adapter implementation for the 13 forks, a rewrite for
+anything outside it.
 
 ## What revision 3 gives up
 
